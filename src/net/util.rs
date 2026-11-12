@@ -631,11 +631,18 @@ pub(crate) async fn read_lp<'a>(
     if size > max_message_size {
         return Err(e!(ReadError::TooLarge));
     }
-    buffer.resize(size, 0u8);
-    reader
-        .read_exact(&mut buffer[..])
-        .await
-        .map_err(io::Error::other)?;
+    // The buffer grows with the bytes that arrive. Sizing it to the declared length up
+    // front would let a peer that declares `max_message_size` on every stream and sends
+    // nothing more hold that much memory per stream.
+    buffer.clear();
+    while buffer.len() < size {
+        let chunk = reader
+            .read_chunk(size - buffer.len())
+            .await
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+        buffer.extend_from_slice(&chunk);
+    }
     Ok(Some(&buffer[..]))
 }
 
@@ -728,9 +735,93 @@ impl<T> Timers<T> {
 
 #[cfg(test)]
 mod tests {
+    use iroh::{
+        endpoint::{presets, Connection},
+        Endpoint, EndpointAddr, RelayMode, TransportAddr,
+    };
     use serde::Deserialize;
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
+
+    const TEST_ALPN: &[u8] = b"iroh-gossip/test/wire";
+
+    async fn loopback_endpoint() -> Endpoint {
+        Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .expect("valid bind address")
+            .bind()
+            .await
+            .expect("bind")
+    }
+
+    /// A connection from a new endpoint to another, accepted on the other side.
+    async fn connected_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        let a = loopback_endpoint().await;
+        let b = loopback_endpoint().await;
+        let addr = EndpointAddr {
+            id: b.id(),
+            addrs: b
+                .bound_sockets()
+                .into_iter()
+                .map(TransportAddr::Ip)
+                .collect(),
+        };
+        let (dialed, accepted) = tokio::join!(a.connect(addr, TEST_ALPN), async {
+            b.accept().await.expect("incoming").await.expect("accept")
+        });
+        (a, b, dialed.expect("connect"), accepted)
+    }
+
+    /// A frame that arrives in several writes is read whole.
+    #[tokio::test]
+    async fn read_lp_reads_a_frame_sent_in_pieces() {
+        let (_a, _b, dialed, accepted) = connected_pair().await;
+        let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        let mut send = dialed.open_uni().await.expect("open");
+        send.write_u32(payload.len() as u32).await.expect("write");
+        for piece in payload.chunks(7_000) {
+            send.write_all(piece).await.expect("write");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        send.finish().expect("finish");
+
+        let mut recv = accepted.accept_uni().await.expect("accept");
+        let mut buffer = BytesMut::new();
+        let frame = read_lp(&mut recv, &mut buffer, 64 * 1024)
+            .await
+            .expect("read")
+            .expect("frame");
+        assert_eq!(frame, &payload[..]);
+        assert_eq!(
+            read_lp(&mut recv, &mut buffer, 64 * 1024)
+                .await
+                .expect("read"),
+            None
+        );
+    }
+
+    /// A frame whose declared length is not sent holds only the bytes that arrived.
+    #[tokio::test]
+    async fn read_lp_does_not_allocate_the_declared_length() {
+        let (_a, _b, dialed, accepted) = connected_pair().await;
+        let mut send = dialed.open_uni().await.expect("open");
+        send.write_u32(60_000).await.expect("write");
+        send.write_all(&[1; 10]).await.expect("write");
+
+        let mut recv = accepted.accept_uni().await.expect("accept");
+        let mut buffer = BytesMut::new();
+        let read = tokio::time::timeout(
+            Duration::from_millis(200),
+            read_lp(&mut recv, &mut buffer, 64 * 1024),
+        )
+        .await;
+        assert!(read.is_err(), "the frame is incomplete");
+        assert!(buffer.capacity() < 60_000, "capacity {}", buffer.capacity());
+    }
 
     /// The header as nodes up to 0.101 encode and decode it.
     #[derive(Debug, Serialize, Deserialize)]
