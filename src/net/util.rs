@@ -3,6 +3,10 @@
 use std::{
     collections::{hash_map, BTreeMap, HashMap},
     io,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -79,6 +83,15 @@ const HANDLES_CLOSE: u8 = 1;
 /// A peer that keeps many partial headers thus delays only its own streams.
 pub(crate) const MAX_PENDING_HEADERS: usize = 16;
 
+/// The default of [`Builder::max_recv_buffer`](super::Builder::max_recv_buffer).
+pub(crate) const RECV_BUFFER_SIZE: usize = 1 << 20;
+
+/// The part of the storage of each stream that no [`RecvBufferLimit`] counts.
+///
+/// A stream keeps storage up to this size between frames, so the streams of
+/// most control messages reuse it. It frees larger storage after each frame.
+pub(crate) const RETAINED_BUFFER: usize = 1024;
+
 /// Errors related to message writing
 #[allow(missing_docs)]
 #[stack_error(derive, add_meta, from_sources)]
@@ -131,7 +144,7 @@ pub(crate) struct StreamHeader {
 impl StreamHeader {
     pub(crate) async fn read(
         stream: &mut RecvStream,
-        buffer: &mut BytesMut,
+        buffer: &mut FrameBuffer,
         max_message_size: usize,
     ) -> Result<Self, ReadError> {
         let frame = read_lp(stream, buffer, max_message_size)
@@ -142,7 +155,9 @@ impl StreamHeader {
                     "stream ended before header",
                 ))
             })?;
-        Self::decode(frame)
+        let header = Self::decode(frame);
+        buffer.clear();
+        header
     }
 
     fn decode(frame: &[u8]) -> Result<Self, ReadError> {
@@ -177,6 +192,8 @@ pub(crate) struct RecvLoop {
     handles_close: watch::Sender<bool>,
     /// Whether the peer has a stream open to us, from its first byte on.
     has_streams: watch::Sender<bool>,
+    /// Counts the frame storage of all streams of the connection.
+    buffer_limit: RecvBufferLimit,
 }
 
 impl RecvLoop {
@@ -185,6 +202,7 @@ impl RecvLoop {
         conn: Connection,
         in_event_tx: mpsc::Sender<InEvent>,
         max_message_size: usize,
+        max_recv_buffer: usize,
         handles_close: watch::Sender<bool>,
         has_streams: watch::Sender<bool>,
     ) -> Self {
@@ -195,7 +213,13 @@ impl RecvLoop {
             in_event_tx,
             handles_close,
             has_streams,
+            buffer_limit: RecvBufferLimit::new(max_recv_buffer),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_limit(&self) -> RecvBufferLimit {
+        self.buffer_limit.clone()
     }
 
     /// Reads the streams of the connection until it closes or the actor stops.
@@ -228,7 +252,8 @@ impl RecvLoop {
                             continue;
                         }
                     };
-                    header_futures.push(RecvStreamState::new(stream, self.max_message_size));
+                    let buffer = FrameBuffer::new(self.buffer_limit.clone());
+                    header_futures.push(RecvStreamState::new(stream, buffer, self.max_message_size));
                 }
                 Some(state) = header_futures.next(), if !header_futures.is_empty() => {
                     // A bad header loses only its stream, as a bad frame does.
@@ -298,13 +323,16 @@ enum Order {
 struct RecvStreamState {
     stream: RecvStream,
     header: StreamHeader,
-    buffer: BytesMut,
+    buffer: FrameBuffer,
     max_message_size: usize,
 }
 
 impl RecvStreamState {
-    async fn new(mut stream: RecvStream, max_message_size: usize) -> Result<Self, ReadError> {
-        let mut buffer = BytesMut::new();
+    async fn new(
+        mut stream: RecvStream,
+        mut buffer: FrameBuffer,
+        max_message_size: usize,
+    ) -> Result<Self, ReadError> {
         let header = StreamHeader::read(&mut stream, &mut buffer, max_message_size).await?;
         Ok(Self {
             buffer,
@@ -599,27 +627,137 @@ pub(crate) enum ReadError {
     /// Message was larger than the configured maximum message size
     #[error("message too large")]
     TooLarge {},
+    /// The frame storage of the connection reached its limit
+    #[error("receive buffer limit of the connection reached")]
+    BufferLimit {},
+}
+
+/// Counts the frame storage of the streams of one connection, see [`Builder::max_recv_buffer`].
+///
+/// [`Builder::max_recv_buffer`]: super::Builder::max_recv_buffer
+#[derive(Debug, Clone)]
+pub(crate) struct RecvBufferLimit {
+    used: Arc<AtomicUsize>,
+    max: usize,
+}
+
+impl RecvBufferLimit {
+    pub(crate) fn new(max: usize) -> Self {
+        Self {
+            used: Default::default(),
+            max,
+        }
+    }
+
+    /// Adds `bytes` to the count, unless the count would exceed the limit.
+    fn try_add(&self, bytes: usize) -> bool {
+        let used = self.used.fetch_add(bytes, Ordering::Relaxed);
+        if used.saturating_add(bytes) <= self.max {
+            return true;
+        }
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
+        false
+    }
+
+    fn sub(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+}
+
+/// The frame storage of one stream.
+///
+/// Its storage over [`RETAINED_BUFFER`] counts toward a [`RecvBufferLimit`].
+#[derive(Debug)]
+pub(crate) struct FrameBuffer {
+    bytes: BytesMut,
+    /// The part of the storage of `bytes` that `limit` counts.
+    counted: usize,
+    limit: RecvBufferLimit,
+}
+
+impl FrameBuffer {
+    pub(crate) fn new(limit: RecvBufferLimit) -> Self {
+        Self {
+            bytes: BytesMut::new(),
+            counted: 0,
+            limit,
+        }
+    }
+
+    /// A buffer without a limit, for tests that read as a peer does.
+    #[cfg(test)]
+    pub(crate) fn unlimited() -> Self {
+        Self::new(RecvBufferLimit::new(usize::MAX))
+    }
+
+    /// Appends `chunk` to the start of a frame of `frame_len` bytes.
+    ///
+    /// The storage doubles when it is full, as a `Vec` does, but never past the
+    /// frame. Fails before it allocates storage that would exceed the limit.
+    fn extend(&mut self, chunk: &[u8], frame_len: usize) -> Result<(), ReadError> {
+        let len = self.bytes.len() + chunk.len();
+        if len > self.bytes.capacity() {
+            let capacity = (2 * self.bytes.capacity()).min(frame_len).max(len);
+            let counted = capacity.saturating_sub(RETAINED_BUFFER);
+            if counted > self.counted {
+                if !self.limit.try_add(counted - self.counted) {
+                    return Err(e!(ReadError::BufferLimit));
+                }
+                self.counted = counted;
+            }
+            let mut grown = BytesMut::with_capacity(capacity);
+            grown.extend_from_slice(&self.bytes);
+            self.bytes = grown;
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// Empties the buffer, and frees its storage if it is over [`RETAINED_BUFFER`].
+    pub(crate) fn clear(&mut self) {
+        if self.bytes.capacity() > RETAINED_BUFFER {
+            self.bytes = BytesMut::new();
+            self.limit.sub(std::mem::take(&mut self.counted));
+        } else {
+            self.bytes.clear();
+        }
+    }
+}
+
+impl Drop for FrameBuffer {
+    fn drop(&mut self) {
+        self.limit.sub(self.counted);
+    }
 }
 
 /// Read a length-prefixed frame and decode with postcard.
+///
+/// Frees the storage of `buffer` over [`RETAINED_BUFFER`] once the frame is decoded.
 pub(crate) async fn read_frame<T: DeserializeOwned>(
     reader: &mut RecvStream,
-    buffer: &mut BytesMut,
+    buffer: &mut FrameBuffer,
     max_message_size: usize,
 ) -> Result<Option<T>, ReadError> {
     let Some(data) = read_lp(reader, buffer, max_message_size).await? else {
         return Ok(None);
     };
-    Ok(Some(postcard::from_bytes(data)?))
+    let message = postcard::from_bytes(data);
+    buffer.clear();
+    Ok(Some(message?))
 }
 
 /// Reads a length prefixed buffer.
 ///
-/// Borrows the frame from `buffer`, keeping its storage for the next read.
-/// Returns `None` if the stream ends before the frame length starts.
+/// Borrows the frame from `buffer`. Returns `None` if the stream ends before
+/// the frame length starts.
 pub(crate) async fn read_lp<'a>(
     reader: &mut RecvStream,
-    buffer: &'a mut BytesMut,
+    buffer: &'a mut FrameBuffer,
     max_message_size: usize,
 ) -> Result<Option<&'a [u8]>, ReadError> {
     let size = match reader.read_u32().await {
@@ -635,15 +773,15 @@ pub(crate) async fn read_lp<'a>(
     // front would let a peer that declares `max_message_size` on every stream and sends
     // nothing more hold that much memory per stream.
     buffer.clear();
-    while buffer.len() < size {
+    while buffer.bytes.len() < size {
         let chunk = reader
-            .read_chunk(size - buffer.len())
+            .read_chunk(size - buffer.bytes.len())
             .await
             .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
-        buffer.extend_from_slice(&chunk);
+        buffer.extend(&chunk, size)?;
     }
-    Ok(Some(&buffer[..]))
+    Ok(Some(&buffer.bytes[..]))
 }
 
 /// Writes a length-prefixed frame.
@@ -790,7 +928,7 @@ mod tests {
         send.finish().expect("finish");
 
         let mut recv = accepted.accept_uni().await.expect("accept");
-        let mut buffer = BytesMut::new();
+        let mut buffer = FrameBuffer::unlimited();
         let frame = read_lp(&mut recv, &mut buffer, 64 * 1024)
             .await
             .expect("read")
@@ -813,14 +951,146 @@ mod tests {
         send.write_all(&[1; 10]).await.expect("write");
 
         let mut recv = accepted.accept_uni().await.expect("accept");
-        let mut buffer = BytesMut::new();
+        let mut buffer = FrameBuffer::unlimited();
         let read = tokio::time::timeout(
             Duration::from_millis(200),
             read_lp(&mut recv, &mut buffer, 64 * 1024),
         )
         .await;
         assert!(read.is_err(), "the frame is incomplete");
-        assert!(buffer.capacity() < 60_000, "capacity {}", buffer.capacity());
+        let capacity = buffer.bytes.capacity();
+        assert!(capacity < 60_000, "capacity {capacity}");
+    }
+
+    /// A buffer counts its storage over `RETAINED_BUFFER`, grows no further than its
+    /// frame, refuses to grow past the limit, and returns its count when it frees
+    /// the storage or drops.
+    #[test]
+    fn frame_buffer_counts_its_storage_toward_the_limit() {
+        let limit = RecvBufferLimit::new(8_000);
+
+        let mut small = FrameBuffer::new(limit.clone());
+        small.extend(&[1; 500], 500).expect("fits");
+        small.clear();
+        assert_eq!(small.bytes.capacity(), 500, "small storage is kept");
+        assert_eq!(limit.used(), 0, "small storage is not counted");
+
+        let mut first = FrameBuffer::new(limit.clone());
+        for _ in 0..10 {
+            first.extend(&[1; 600], 6_000).expect("fits");
+        }
+        assert_eq!(first.bytes.len(), 6_000);
+        assert_eq!(
+            first.bytes.capacity(),
+            6_000,
+            "the storage ends at the frame"
+        );
+        assert_eq!(limit.used(), 6_000 - RETAINED_BUFFER);
+
+        let mut second = FrameBuffer::new(limit.clone());
+        second.extend(&[1; 1_000], 8_000).expect("fits");
+        let refused = second.extend(&[1; 4_000], 8_000);
+        assert!(
+            matches!(refused, Err(ReadError::BufferLimit { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(
+            second.bytes.capacity(),
+            1_000,
+            "refused before the allocation"
+        );
+        assert_eq!(limit.used(), 6_000 - RETAINED_BUFFER);
+
+        first.clear();
+        assert_eq!(first.bytes.capacity(), 0, "large storage is freed");
+        assert_eq!(limit.used(), 0);
+        second
+            .extend(&[1; 4_000], 8_000)
+            .expect("fits once the first is freed");
+        assert_eq!(limit.used(), 5_000 - RETAINED_BUFFER);
+        drop(second);
+        assert_eq!(limit.used(), 0, "a dropped buffer returns its count");
+    }
+
+    /// A peer that sends part of a frame on each of many topics makes the
+    /// connection hold no more than the limit: the streams whose bytes would
+    /// exceed it are stopped. Small frames still arrive, and the storage of
+    /// streams that end returns to the limit.
+    #[tokio::test]
+    async fn recv_loop_stops_the_streams_over_the_buffer_limit() {
+        const LIMIT: usize = 100_000;
+        const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+        let (_a, _b, dialed, accepted) = connected_pair().await;
+        let (in_event_tx, mut in_event_rx) = mpsc::channel(16);
+        let mut recv_loop = RecvLoop::new(
+            accepted.remote_id(),
+            accepted,
+            in_event_tx,
+            MAX_MESSAGE_SIZE,
+            LIMIT,
+            watch::Sender::new(false),
+            watch::Sender::new(false),
+        );
+        let limit = recv_loop.buffer_limit();
+        let _recv =
+            n0_future::task::AbortOnDropHandle::new(tokio::spawn(
+                async move { recv_loop.run().await },
+            ));
+
+        let mut buffer = Vec::new();
+        let mut streams = Vec::new();
+        for i in 0..10u8 {
+            let mut send = dialed.open_uni().await.expect("open");
+            StreamHeader::write([i; 32].into(), &mut send, &mut buffer, MAX_MESSAGE_SIZE)
+                .await
+                .expect("header");
+            send.write_u32(60_000).await.expect("write");
+            // The peer may stop the stream during the write.
+            send.write_all(&[1; 30_000]).await.ok();
+            streams.push(send);
+        }
+        // Each partial frame counts between 30_000 and 60_000 bytes, less the
+        // retained part, so one to three of them fit.
+        let stopped = streams
+            .iter()
+            .map(|send| tokio::time::timeout(Duration::from_secs(2), send.stopped()))
+            .collect::<FuturesUnordered<_>>()
+            .filter(|res| res.is_ok())
+            .count()
+            .await;
+        assert!(
+            (7..=9).contains(&stopped),
+            "{stopped} of 10 streams stopped"
+        );
+        let used = limit.used();
+        assert!(used > 0 && used <= LIMIT, "{used} bytes counted");
+
+        let topic: TopicId = [100; 32].into();
+        let mut send = dialed.open_uni().await.expect("open");
+        StreamHeader::write(topic, &mut send, &mut buffer, MAX_MESSAGE_SIZE)
+            .await
+            .expect("header");
+        let message = crate::proto::topic::Message::<EndpointId>::test_disconnect();
+        write_frame(&mut send, &message, &mut buffer, MAX_MESSAGE_SIZE)
+            .await
+            .expect("write");
+        let event = tokio::time::timeout(Duration::from_secs(5), in_event_rx.recv())
+            .await
+            .expect("the small frame arrived in time");
+        assert!(
+            matches!(&event, Some(InEvent::RecvMessage(_, message)) if message.topic == topic),
+            "{event:?}"
+        );
+
+        // Dropping a stream finishes it, which ends its partial frame with an error.
+        drop(streams);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while limit.used() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the ended streams returned their storage");
     }
 
     /// The header as nodes up to 0.101 encode and decode it.

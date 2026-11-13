@@ -177,6 +177,7 @@ pub struct Builder {
     config: proto::Config,
     alpn: Option<Bytes>,
     send_queue: QueueOptions,
+    max_recv_buffer: usize,
 }
 
 impl Builder {
@@ -233,6 +234,26 @@ impl Builder {
         self
     }
 
+    /// Sets the maximum number of bytes that the frame buffers of one connection hold, 1 MiB by default.
+    ///
+    /// The peer of a connection can open a stream for each topic and send part
+    /// of a frame on each. Without a limit, the connection would hold up to the
+    /// `max_concurrent_uni_streams` of the endpoint times [`Self::max_message_size`].
+    /// A stream whose next bytes would exceed the limit is stopped: the message
+    /// that they belong to is lost, as are the messages that the peer wrote to
+    /// the stream after it. The peer opens a new stream for the next message of
+    /// the topic.
+    ///
+    /// The first 1 KiB of the storage of each stream does not count, and a
+    /// stream keeps up to that much between frames. A connection thus holds at
+    /// most the limit plus 1 KiB per stream. Whatever the setting, the limit is
+    /// at least the maximum message size, so that a frame of that size always
+    /// fits on its own.
+    pub fn max_recv_buffer(mut self, size: usize) -> Self {
+        self.max_recv_buffer = size;
+        self
+    }
+
     /// Spawn a gossip actor and get a handle for it
     ///
     /// This has to run inside a tokio runtime. The actor stops when you drop the last clone of
@@ -258,6 +279,7 @@ impl Builder {
         );
         actor.send_queue_size =
             queue::queue_size(self.send_queue.size, actor.state.max_message_size());
+        actor.max_recv_buffer = self.max_recv_buffer.max(actor.state.max_message_size());
         let me = actor.endpoint.id().fmt_short();
         let max_message_size = actor.state.max_message_size();
 
@@ -342,6 +364,7 @@ impl Gossip {
             config: Default::default(),
             alpn: None,
             send_queue: Default::default(),
+            max_recv_buffer: util::RECV_BUFFER_SIZE,
         }
     }
 
@@ -432,6 +455,8 @@ struct Actor {
     address_lookup: GossipAddressLookup,
     /// The size of the queue to each peer, see [`QueueOptions::size`].
     send_queue_size: usize,
+    /// The limit of the frame storage of each connection, see [`Builder::max_recv_buffer`].
+    max_recv_buffer: usize,
     /// Events that the handling of an event caused, handled after it.
     follow_ups: VecDeque<InEvent>,
     /// Scratch buffer for use in [`Self::handle_proto_event`].
@@ -461,6 +486,7 @@ impl Actor {
             rand::rngs::StdRng::from_rng(&mut rand::rng()),
         );
         let send_queue_size = queue::queue_size(queue::QUEUE_SIZE, state.max_message_size());
+        let max_recv_buffer = util::RECV_BUFFER_SIZE.max(state.max_message_size());
         let (rpc_tx, rpc_rx) = mpsc::channel(TO_ACTOR_CAP);
         let (local_tx, local_rx) = mpsc::channel(16);
         let (in_event_tx, in_event_rx) = mpsc::channel(IN_EVENT_CAP);
@@ -487,6 +513,7 @@ impl Actor {
             topic_event_forwarders: Default::default(),
             address_lookup,
             send_queue_size,
+            max_recv_buffer,
             follow_ups: Default::default(),
             scratch_touched_peers: Vec::new(),
             scratch_aborted_peers: Vec::new(),
@@ -698,6 +725,7 @@ impl Actor {
         let aborted = peer.aborted.clone();
         let handles_close = peer.handles_close.clone();
         let max_message_size = self.state.max_message_size();
+        let max_recv_buffer = self.max_recv_buffer;
         let in_event_tx = self.in_event_tx.clone();
 
         // Spawn a task for this connection
@@ -711,6 +739,7 @@ impl Actor {
                     initial_topics,
                     in_event_tx,
                     max_message_size,
+                    max_recv_buffer,
                     handles_close,
                 )
                 .await;
@@ -1279,6 +1308,7 @@ async fn connection_loop(
     initial_topics: Vec<TopicId>,
     in_event_tx: mpsc::Sender<InEvent>,
     max_message_size: usize,
+    max_recv_buffer: usize,
     handles_close: watch::Sender<bool>,
 ) -> Result<bool, ConnectionLoopError> {
     debug!(side = ?conn.side(), "connection established");
@@ -1298,6 +1328,7 @@ async fn connection_loop(
         conn.clone(),
         in_event_tx,
         max_message_size,
+        max_recv_buffer,
         handles_close,
         their_streams.clone(),
     );
@@ -1601,7 +1632,7 @@ impl Dialer {
 pub(crate) mod tests {
     use std::{any::Any, collections::HashSet, time::Duration};
 
-    use bytes::{Bytes, BytesMut};
+    use bytes::Bytes;
     use futures_concurrency::future::TryJoin;
     use iroh::{
         address_lookup::memory::MemoryLookup,
@@ -2183,7 +2214,7 @@ pub(crate) mod tests {
     /// Accepts the peer's next stream and reads it to its end.
     async fn read_next_stream(conn: &Connection) -> Result<(TopicId, Vec<TopicMessage>)> {
         let mut stream = conn.accept_uni().await.std_context("accept stream")?;
-        let mut buffer = BytesMut::new();
+        let mut buffer = util::FrameBuffer::unlimited();
         let header = util::StreamHeader::read(&mut stream, &mut buffer, TEST_FRAME_LIMIT)
             .await
             .std_context("read header")?;
@@ -2208,16 +2239,20 @@ pub(crate) mod tests {
     /// Accepts the peer's next stream and reads only its header.
     async fn read_next_header(conn: &Connection) -> Result<TopicId> {
         let mut stream = conn.accept_uni().await.std_context("accept stream")?;
-        let header = util::StreamHeader::read(&mut stream, &mut BytesMut::new(), TEST_FRAME_LIMIT)
-            .await
-            .std_context("read header")?;
+        let header = util::StreamHeader::read(
+            &mut stream,
+            &mut util::FrameBuffer::unlimited(),
+            TEST_FRAME_LIMIT,
+        )
+        .await
+        .std_context("read header")?;
         Ok(header.topic_id)
     }
 
     /// Accepts the peer's next stream and reads its first message.
     async fn read_next_message(conn: &Connection) -> Result<(TopicId, TopicMessage)> {
         let mut stream = conn.accept_uni().await.std_context("accept stream")?;
-        let mut buffer = BytesMut::new();
+        let mut buffer = util::FrameBuffer::unlimited();
         let header = util::StreamHeader::read(&mut stream, &mut buffer, TEST_FRAME_LIMIT)
             .await
             .std_context("read header")?;
@@ -2689,7 +2724,7 @@ pub(crate) mod tests {
         let join = join_message(topic, 0).message;
         let encoded_join = postcard::to_stdvec(&join).std_context("encode")?;
         let mut buffer = Vec::new();
-        let mut read_buffer = BytesMut::new();
+        let mut read_buffer = util::FrameBuffer::unlimited();
 
         // We write, an old node reads.
         let mut stream = conn.open_uni().await.std_context("open stream")?;
@@ -2923,6 +2958,7 @@ pub(crate) mod tests {
             Vec::new(),
             in_event_tx,
             TEST_FRAME_LIMIT,
+            util::RECV_BUFFER_SIZE,
             unset_flag(),
         )));
 
@@ -3083,7 +3119,7 @@ pub(crate) mod tests {
 
         assert!(matches!(queue.push(join_message(topic, 0)), Pushed::Queued));
         let mut stream = peer_conn.accept_uni().await.std_context("accept")?;
-        let mut buffer = BytesMut::new();
+        let mut buffer = util::FrameBuffer::unlimited();
         util::StreamHeader::read(&mut stream, &mut buffer, TEST_FRAME_LIMIT).await?;
         let message: Option<TopicMessage> =
             util::read_frame(&mut stream, &mut buffer, TEST_FRAME_LIMIT).await?;
@@ -3233,6 +3269,7 @@ pub(crate) mod tests {
                 Vec::new(),
                 in_event_tx,
                 TEST_FRAME_LIMIT,
+                util::RECV_BUFFER_SIZE,
                 unset_flag(),
             )));
             if with_stream {
@@ -3269,6 +3306,7 @@ pub(crate) mod tests {
                 Vec::new(),
                 in_event_tx,
                 TEST_FRAME_LIMIT,
+                util::RECV_BUFFER_SIZE,
                 unset_flag(),
             )));
             // As a node up to 0.101 closes a connection when it disconnects us.
@@ -3317,6 +3355,7 @@ pub(crate) mod tests {
             conn,
             in_event_tx,
             TEST_FRAME_LIMIT,
+            util::RECV_BUFFER_SIZE,
             unset_flag(),
             unset_flag(),
         );
@@ -3360,6 +3399,7 @@ pub(crate) mod tests {
             conn,
             in_event_tx,
             TEST_FRAME_LIMIT,
+            util::RECV_BUFFER_SIZE,
             unset_flag(),
             unset_flag(),
         );
@@ -3448,6 +3488,7 @@ pub(crate) mod tests {
             Vec::new(),
             in_event_tx,
             TEST_FRAME_LIMIT,
+            util::RECV_BUFFER_SIZE,
             unset_flag(),
         )));
         assert!(matches!(
@@ -3575,7 +3616,7 @@ pub(crate) mod tests {
 
         let read = async {
             let mut stream = peer_new.accept_uni().await.std_context("accept")?;
-            let mut buffer = BytesMut::new();
+            let mut buffer = util::FrameBuffer::unlimited();
             util::StreamHeader::read(&mut stream, &mut buffer, TEST_FRAME_LIMIT).await?;
             let mut sizes = Vec::new();
             for _ in 0..2 {
@@ -3644,7 +3685,7 @@ pub(crate) mod tests {
             .await
             .std_context("the new connection sent nothing")?
             .std_context("accept")?;
-        let mut new_buffer = BytesMut::new();
+        let mut new_buffer = util::FrameBuffer::unlimited();
         let header =
             util::StreamHeader::read(&mut new_stream, &mut new_buffer, TEST_FRAME_LIMIT).await?;
         assert_eq!(header.topic_id, topic);
@@ -3675,7 +3716,7 @@ pub(crate) mod tests {
         );
 
         let mut stream = peer_old.accept_uni().await.std_context("accept")?;
-        let mut buffer = BytesMut::new();
+        let mut buffer = util::FrameBuffer::unlimited();
         util::StreamHeader::read(&mut stream, &mut buffer, TEST_FRAME_LIMIT).await?;
         let read = async {
             let mut messages = Vec::new();
@@ -4269,7 +4310,7 @@ pub(crate) mod tests {
             let incoming = ep2.accept().await.expect("endpoint closed");
             let conn = incoming.await.expect("accept failed");
             let mut stream = conn.accept_uni().await.expect("accept_uni");
-            let mut buf = bytes::BytesMut::new();
+            let mut buf = util::FrameBuffer::unlimited();
             let header = util::StreamHeader::read(&mut stream, &mut buf, 1024)
                 .await
                 .expect("header");
@@ -4423,7 +4464,7 @@ pub(crate) mod tests {
             let mut first = peer_conn.accept_uni().await.expect("accept_uni");
             first.stop(0u32.into()).expect("stop");
             let mut next = peer_conn.accept_uni().await.expect("accept_uni");
-            let mut buffer = BytesMut::new();
+            let mut buffer = util::FrameBuffer::unlimited();
             let header = util::StreamHeader::read(&mut next, &mut buffer, TEST_FRAME_LIMIT)
                 .await
                 .expect("read header");
@@ -4451,6 +4492,7 @@ pub(crate) mod tests {
             Vec::new(),
             in_event_tx,
             TEST_FRAME_LIMIT,
+            util::RECV_BUFFER_SIZE,
             unset_flag(),
         )));
 
@@ -4491,6 +4533,7 @@ pub(crate) mod tests {
                 Vec::new(),
                 in_event_tx,
                 TEST_FRAME_LIMIT,
+                util::RECV_BUFFER_SIZE,
                 unset_flag(),
             ),
         )
@@ -4536,7 +4579,7 @@ pub(crate) mod tests {
             let incoming = origin.accept().await.expect("endpoint closed");
             let conn = incoming.await.expect("accept failed");
             let mut stream = conn.accept_uni().await.expect("accept_uni");
-            let mut buf = bytes::BytesMut::new();
+            let mut buf = util::FrameBuffer::unlimited();
             let header = util::StreamHeader::read(&mut stream, &mut buf, 1024)
                 .await
                 .expect("header");
@@ -4595,6 +4638,7 @@ pub(crate) mod tests {
             conn,
             in_event_tx,
             1024,
+            util::RECV_BUFFER_SIZE,
             unset_flag(),
             unset_flag(),
         );
@@ -4631,6 +4675,7 @@ pub(crate) mod tests {
                 conn.clone(),
                 in_event_tx,
                 1024,
+                util::RECV_BUFFER_SIZE,
                 unset_flag(),
                 unset_flag(),
             );
@@ -4705,6 +4750,7 @@ pub(crate) mod tests {
             conn,
             in_event_tx,
             1024,
+            util::RECV_BUFFER_SIZE,
             unset_flag(),
             unset_flag(),
         );
@@ -5332,6 +5378,7 @@ pub(crate) mod tests {
             conn,
             in_event_tx,
             1024,
+            util::RECV_BUFFER_SIZE,
             unset_flag(),
             unset_flag(),
         );
@@ -5714,7 +5761,7 @@ pub(crate) mod tests {
 
         let mut stream = peer_conn.accept_uni().await.std_context("accept")?;
         let read: Result<Option<TopicMessage>, _> =
-            util::read_frame(&mut stream, &mut BytesMut::new(), size - 1).await;
+            util::read_frame(&mut stream, &mut util::FrameBuffer::unlimited(), size - 1).await;
         assert!(
             matches!(read, Err(util::ReadError::TooLarge { .. })),
             "{read:?}"
@@ -5748,9 +5795,10 @@ pub(crate) mod tests {
         stream.finish().std_context("finish")?;
 
         let mut stream = peer_conn.accept_uni().await.std_context("accept")?;
-        let read: Option<TopicMessage> = util::read_frame(&mut stream, &mut BytesMut::new(), size)
-            .await
-            .std_context("read")?;
+        let read: Option<TopicMessage> =
+            util::read_frame(&mut stream, &mut util::FrameBuffer::unlimited(), size)
+                .await
+                .std_context("read")?;
         assert!(read.is_some(), "the frame did not arrive");
         Ok(())
     }
@@ -5773,6 +5821,7 @@ pub(crate) mod tests {
             Vec::new(),
             in_event_tx,
             1024,
+            util::RECV_BUFFER_SIZE,
             unset_flag(),
         )));
 
